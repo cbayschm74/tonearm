@@ -4,6 +4,22 @@ Notable changes to tonearm. Versions follow [semantic versioning](https://semver
 while the major version is 0, the minor version carries changes that would
 otherwise be breaking.
 
+## 0.14.1 — 2026-10-19
+
+### Changed
+
+- **The vendored `roonapi` no longer ships its own SOOD discovery.**
+  `discovery.py`, `soodmessage.py`, `.soodmsg` and the two SOOD constants
+  were never used — tonearm's own `tonearm_lib/sood.py` replaced them — and
+  carried bugs of their own that could only ever have bitten a future caller.
+  The removal is a recorded local patch: marked `LOCAL PATCH (tonearm #39)` in
+  the source, listed in `scripts/vendor/README.md`, and pinned by
+  `test_vendor_patches.py` so a vendor refresh cannot quietly restore it.
+  `LICENSE` and `CONTRIBUTING.md` no longer describe the vendored copy as
+  unmodified. Nothing changes at runtime
+  ([#39](https://github.com/ssandys/tonearm/issues/39), [#44](https://github.com/ssandys/tonearm/pull/44),
+  thanks to @Jah-yee).
+
 ## 0.14.0 — 2026-10-08
 
 ### Fixed

@@ -4,6 +4,33 @@ Notable changes to tonearm. Versions follow [semantic versioning](https://semver
 while the major version is 0, the minor version carries changes that would
 otherwise be breaking.
 
+## 0.14.2 — 2026-11-01
+
+### Fixed
+
+- **The shell no longer fetches album art from the Core.** The popup's
+  now-playing cover and every browse row loaded the Core's plain-HTTP image
+  URL directly, inside the shell every bar widget shares. Qt reads the whole
+  response before it decodes anything, so whatever answered on that address
+  could exhaust the shell's memory, and none of the daemon's art limits
+  applied. Raised by the Omarchy marketplace security review.
+
+  Every cover is now fetched by `tonearmd`, under the same size and dimension
+  limits the accent color already relied on, and the popup only ever loads
+  the daemon's local copy. The media-key integration publishes that local
+  copy too, rather than the Core's URL. A test now fails the build if any
+  image in the widget is given anything else.
+
+  The now-playing cover is fetched at display size, so it is as sharp as
+  before. Browse rows show their placeholder for a moment while art arrives
+  rather than loading it themselves.
+
+**Upgrading:** restart the daemon so it picks up the change:
+`systemctl --user restart tonearmd`. Re-running `./setup.sh` is not enough on
+its own — it starts the service but does not restart one already running.
+Until the restart the cover shows softer and browse rows show placeholders;
+the shell fetches nothing either way.
+
 ## 0.14.1 — 2026-10-19
 
 ### Changed

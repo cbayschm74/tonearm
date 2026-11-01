@@ -7,7 +7,7 @@ import qs.Ui
 // decided by import order rather than by anything visible at the use site.
 // The shell's own qs.Ui TextField is the one that carries the theme. Nothing
 // else here needs Controls -- ListView and Text are QtQuick.
-// REQUIRED: this file calls Model.moveCursor and Model.rowArtUrl.
+// REQUIRED: this file calls Model.moveCursor and Model.rowArtSource.
 // Without this import each is a ReferenceError raised inside
 // a signal handler -- invisible to qmllint, and it fails as a pane whose
 // arrow keys silently do nothing.
@@ -53,6 +53,15 @@ Item {
   property bool busy: false
   property string errorText: ""
   property bool editing: false
+
+  // Row art the daemon delivered AFTER a level's first reply, keyed by
+  // image_key. tonearmd fetches row thumbnails in the background (art.py,
+  // RowArtCache) and waits only for the first screenful before replying, so
+  // the rest arrive through a few `current` re-reads. Kept apart from `rows`
+  // so filling in art never resets the ListView's model -- and with it the
+  // scroll position and the delegates already drawn.
+  property var artMap: ({})
+  property int artRetries: 0
 
   readonly property int rowCount: rows.length
   readonly property bool hasResults: rows.length > 0
@@ -177,6 +186,40 @@ Item {
     root.levelId = reply.level_id
     root.path = reply.path || []
     root.cursor = Model.moveCursor(levelChanged ? -1 : root.cursor, 0, root.rows.length)
+    root.artMap = Model.mergeRowArt(root.artMap, root.rows)
+    if (levelChanged) root.artRetries = 0
+    root._scheduleArt()
+  }
+
+  function _scheduleArt() {
+    if (root.artRetries < Model.ROW_ART_RETRIES && Model.rowArtPending(root.rows, root.artMap))
+      artTimer.restart()
+    else
+      artTimer.stop()
+  }
+
+  // Deliberately NOT through _send: it must not set `busy` (which would
+  // swallow a keypress landing meanwhile) and its reply must not replace
+  // `rows`. Only the art map is read from it, and only for the level still
+  // on screen. A daemon older than 0.14.2 refuses `current` with ok:false,
+  // which ends the retries quietly -- its rows simply keep their placeholder.
+  function _refreshArt() {
+    if (!root.service || !root.visible) return
+    root.artRetries += 1
+    var level = root.levelId
+    root.service.browse(root.session, ["current"], function (reply) {
+      if (!reply || reply.ok === false || reply.level_id !== level
+          || level !== root.levelId) return
+      root.artMap = Model.mergeRowArt(root.artMap, reply.rows)
+      root._scheduleArt()
+    })
+  }
+
+  Timer {
+    id: artTimer
+    interval: Model.ROW_ART_RETRY_MS
+    repeat: false
+    onTriggered: root._refreshArt()
   }
 
   // `after` runs once the reply has been applied, so a caller can react to
@@ -379,13 +422,18 @@ Item {
             visible: modelData.image_key !== null
                      && modelData.image_key !== undefined
 
+            // The daemon's cached thumbnail, never a Core URL (marketplace
+            // security review, 2026-10-31). "" until it lands, and the muted
+            // square behind is what shows meanwhile -- or for good, if the
+            // fetch failed or the file will not decode.
             Image {
               anchors.fill: parent
-              source: Model.rowArtUrl(root.state, modelData, root.artPx * 2)
+              source: Model.rowArtSource(modelData, root.artMap)
               sourceSize.width: root.artPx * 2
               sourceSize.height: root.artPx * 2
               fillMode: Image.PreserveAspectCrop
               asynchronous: true
+              visible: status === Image.Ready
             }
           }
 

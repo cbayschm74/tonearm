@@ -124,7 +124,10 @@ Constraints on that scan:
   interfaces than that stops at the budget and logs it.
 
 **After that**, the only traffic is to your Core: a WebSocket to port 9330 for
-the Roon MOO protocol, and HTTP GETs to the same host for album art.
+the Roon MOO protocol, and HTTP GETs to the same host for album art. Those
+GETs are made by `tonearmd`, never by the shell: the daemon caps each image's
+size and dimensions, keeps the copy in its own runtime directory, and the popup
+only ever loads that local file.
 
 **Nothing leaves your network.** There is no telemetry, no analytics, and no
 outbound connection to anything but your Roon Core.

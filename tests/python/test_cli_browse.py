@@ -89,6 +89,11 @@ class TestBrowseSessionKey(unittest.TestCase):
         self.assertEqual(request["index"], 2)
         self.assertEqual(request["level_id"], 7)
 
+    def test_current_takes_no_arguments(self):
+        self.assertEqual(
+            cli.browse_request(["browse", "--session", "widget", "current"]),
+            {"cmd": "browse", "session": "widget", "op": "current"})
+
     def test_a_flag_with_no_value_returns_none(self):
         self.assertIsNone(cli.browse_request(["browse", "--session"]))
 

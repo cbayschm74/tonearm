@@ -2,70 +2,10 @@ const test = require("node:test")
 const assert = require("node:assert")
 const M = require("../Model.js")
 
-const CORE = { host: "192.168.50.118", http_port: 9330, name: "yavin" }
-const STATE = { v: 1, status: "ok", core: CORE, zone: null, zones: [] }
-const ROW = {
-  title: "Dead Man's Party", subtitle: "Oingo Boingo",
-  image_key: "48f5b5fe1ee1dcd0f89bf0f6babcc93a",
-  can_descend: true, can_play: true
-}
-
-test("imageUrl builds a Core image URL from a bare key", () => {
-  assert.strictEqual(
-    M.imageUrl(CORE, "abc", 64),
-    "http://192.168.50.118:9330/api/image/abc?scale=fit&width=64&height=64")
-})
-
-test("imageUrl returns empty string with no core", () => {
-  assert.strictEqual(M.imageUrl(null, "abc", 64), "")
-})
-
-test("imageUrl returns empty string with no key", () => {
-  assert.strictEqual(M.imageUrl(CORE, null, 64), "")
-})
-
-// --- hardening: the widget side of the same rule the daemon already applies.
-// art.py percent-encodes image_key before building its URL ("image_key is
-// untrusted (it comes from the Core)"). Model.js interpolated it raw, and the
-// URL it produces is handed to Image.source inside the shared shell process.
-test("imageUrl percent-encodes a key carrying URL syntax", () => {
-  const url = M.imageUrl(CORE, "a/b?c#d", 64)
-  assert.ok(url.indexOf("/api/image/a%2Fb%3Fc%23d?") > 0, url)
-})
-
-test("imageUrl keeps the caller's query parameters intact", () => {
-  // A key containing ? or & must not be able to add or replace scale/width.
-  const url = M.imageUrl(CORE, "k&width=99999", 64)
-  assert.ok(url.indexOf("width=64") > 0, url)
-  assert.strictEqual(url.split("width=").length, 2, url)
-})
-
-test("imageUrl leaves an ordinary key unchanged", () => {
-  assert.ok(M.imageUrl(CORE, "abc123", 64).indexOf("/api/image/abc123?") > 0)
-})
-
-test("imageUrl falls back to port 9330", () => {
-  assert.ok(M.imageUrl({ host: "h" }, "k", 32).indexOf(":9330/") > 0)
-})
-
-test("rowArtUrl uses the row's own image_key", () => {
-  assert.ok(M.rowArtUrl(STATE, ROW, 48)
-    .indexOf("48f5b5fe1ee1dcd0f89bf0f6babcc93a") > 0)
-})
-
-test("rowArtUrl is empty for a row with no art -- a category", () => {
-  // Measured: category rows carry image_key null (spec 2.4).
-  assert.strictEqual(
-    M.rowArtUrl(STATE, { title: "Albums", image_key: null }, 48), "")
-})
-
-test("artUrl still works and still reads now_playing", () => {
-  const playing = {
-    v: 1, status: "ok", core: CORE,
-    zone: { now_playing: { image_key: "zzz" } }, zones: []
-  }
-  assert.ok(M.artUrl(playing, 256).indexOf("/api/image/zzz") > 0)
-})
+// The imageUrl/rowArtUrl/artUrl tests that lived here pinned the http:// URL
+// the widget used to load straight from the Core. That URL is gone (marketplace
+// security review, 2026-10-31); row and now-playing art are covered by
+// model-art.test.js, which asserts the opposite.
 
 test("moveCursor steps down and stops at the last row", () => {
   assert.strictEqual(M.moveCursor(0, 1, 3), 1)

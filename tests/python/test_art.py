@@ -206,12 +206,12 @@ class TestImageUrl(unittest.TestCase):
         # image_key comes from the Core and is untrusted; it must not be
         # interpolated into the URL raw, mirroring the caution _safe_name
         # already applies on the filesystem side.
-        url = art._image_url("host", 9330, "a b/c?d")
+        url = art._image_url("host", 9330, "a b/c?d", px=64)
         self.assertEqual(
             url, "http://host:9330/api/image/a%20b%2Fc%3Fd?scale=fit&width=64&height=64")
 
     def test_an_ordinary_key_round_trips_unchanged(self):
-        url = art._image_url("192.168.50.118", 9330, "abc123")
+        url = art._image_url("192.168.50.118", 9330, "abc123", px=64)
         self.assertEqual(
             url,
             "http://192.168.50.118:9330/api/image/abc123?scale=fit&width=64&height=64")
@@ -722,3 +722,230 @@ class TestOnlyASafeFileIsPublished(ArtServerTestCase):
         os.mkfifo(dest)
         self.addCleanup(os.unlink, dest)
         self.assertIsNone(cache.get(self.host, self.port, "k"))
+
+
+# --- marketplace security review 2026-10-31 --------------------------------
+#
+# "Panel.qml:406-416 loads Model.artUrl() directly in Qt Image; Model.js
+# constructs the configured Roon Core's plaintext HTTP image URL. An attacker
+# controlling/spoofing that referenced Core response can exhaust shared-shell
+# memory with an oversized body before decoding; sourceSize acts later, and
+# the separate art helper's byte cap/tonearmd MemoryMax do not contain this
+# shell-side fetch."
+#
+# The widget no longer fetches anything. Every cover it shows -- now playing
+# and every browse row -- is fetched here, through fetch()'s caps, and reaches
+# QML only as a path in the 0700 cache.
+
+
+class TestNowPlayingArtIsDisplaySized(ArtServerTestCase):
+    """The cached copy is now what the popup DISPLAYS, not only what
+    ColorQuantizer samples, so it is fetched at display size."""
+
+    def test_the_now_playing_copy_is_fetched_at_display_size(self):
+        cache = art.Cache(self.tmp.name)
+        with patch.object(art, "fetch", wraps=art.fetch) as spy:
+            cache.get(self.host, self.port, "abc123")
+            cache._last_thread.join(3)
+        self.assertTrue(spy.called)
+        self.assertEqual(spy.call_args.kwargs.get("px"), art.NOW_PLAYING_PX)
+
+    def test_display_size_is_sharp_and_still_inside_the_bounds(self):
+        # The popup draws the cover at roughly 236 device pixels by default
+        # and more under a scaled theme; 64 was a quantizer sample, not art.
+        self.assertGreaterEqual(art.NOW_PLAYING_PX, 256)
+        self.assertLessEqual(art.NOW_PLAYING_PX, art.MAX_ART_DIMENSION)
+        self.assertLessEqual(art.ROW_PX, art.MAX_ART_DIMENSION)
+
+    def test_the_url_asks_for_the_requested_size(self):
+        url = art._image_url("h", 9330, "k", px=art.ROW_PX)
+        self.assertTrue(url.endswith("width=%d&height=%d" % (art.ROW_PX, art.ROW_PX)), url)
+
+    def test_fetch_honours_a_smaller_byte_cap(self):
+        dest = os.path.join(self.tmp.name, "rowart", "k.jpg")
+        self.assertFalse(art.fetch(self.host, self.port, "k", dest,
+                                   max_bytes=len(IMAGE_BYTES) - 1))
+        self.assertFalse(os.path.exists(dest))
+        self.assertTrue(art.fetch(self.host, self.port, "k", dest,
+                                  max_bytes=len(IMAGE_BYTES)))
+
+    def test_is_publishable_honours_a_smaller_byte_cap(self):
+        dest = os.path.join(self.tmp.name, "k.jpg")
+        with open(dest, "wb") as handle:
+            handle.write(IMAGE_BYTES)
+        self.assertTrue(art.is_publishable(dest, max_bytes=len(IMAGE_BYTES)))
+        self.assertFalse(art.is_publishable(dest, max_bytes=len(IMAGE_BYTES) - 1))
+
+
+class TestRowArtCache(ArtServerTestCase):
+    def cache(self):
+        rows = art.RowArtCache(self.tmp.name)
+        self.addCleanup(rows.close)
+        return rows
+
+    def test_its_directory_is_created_eagerly_beside_the_now_playing_one(self):
+        rows = self.cache()
+        self.assertEqual(rows._dir, os.path.join(self.tmp.name, "rowart"))
+        self.assertTrue(os.path.isdir(rows._dir))
+        self.assertEqual(stat_mode(rows._dir), 0o700)
+
+    def test_first_get_schedules_and_a_later_one_returns_the_path(self):
+        rows = self.cache()
+        self.assertIsNone(rows.get(self.host, self.port, "abc123"))
+        rows.wait(["abc123"], 3)
+        path = rows.get(self.host, self.port, "abc123")
+        self.assertEqual(path, art.path_for(rows._dir, "abc123"))
+        self.assertTrue(art.is_publishable(path, max_bytes=art.MAX_ROW_ART_BYTES))
+
+    def test_rows_are_fetched_at_row_size_under_the_row_byte_cap(self):
+        rows = self.cache()
+        with patch.object(art, "fetch", wraps=art.fetch) as spy:
+            rows.get(self.host, self.port, "abc123")
+            rows.wait(["abc123"], 3)
+        self.assertEqual(spy.call_args.kwargs.get("px"), art.ROW_PX)
+        self.assertEqual(spy.call_args.kwargs.get("max_bytes"), art.MAX_ROW_ART_BYTES)
+        self.assertLess(art.MAX_ROW_ART_BYTES, art.MAX_ART_BYTES)
+
+    def test_a_failed_key_is_not_refetched_on_every_browse(self):
+        rows = self.cache()
+        with patch.object(art, "fetch", wraps=art.fetch) as spy:
+            for _ in range(3):
+                self.assertIsNone(rows.get(self.host, self.port, "missing"))
+                rows.wait(["missing"], 3)
+        self.assertEqual(spy.call_count, 1)
+
+    def test_a_key_already_queued_is_not_queued_twice(self):
+        rows = self.cache()
+        gate = threading.Event()
+        calls = []
+
+        def slow(*args, **kwargs):
+            calls.append(args[2])
+            gate.wait(3)
+            return False
+
+        with patch.object(art, "fetch", side_effect=slow):
+            rows.get(self.host, self.port, "k")
+            rows.get(self.host, self.port, "k")
+            gate.set()
+            rows.wait(["k"], 3)
+        self.assertEqual(calls, ["k"])
+
+    def test_the_queue_is_bounded(self):
+        rows = self.cache()
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+
+        def blocked(*_args, **_kwargs):
+            gate.wait(3)
+            return False
+
+        with patch.object(art, "MAX_ROW_PENDING", 3), \
+                patch.object(art, "fetch", side_effect=blocked):
+            for i in range(20):
+                rows.get(self.host, self.port, "k%d" % i)
+            self.assertLessEqual(len(rows._pending), 3)
+            gate.set()
+
+    def test_no_host_or_key_schedules_nothing(self):
+        rows = self.cache()
+        self.assertIsNone(rows.get(None, self.port, "k"))
+        self.assertIsNone(rows.get(self.host, self.port, None))
+        self.assertEqual(rows._pending, {})
+
+    def test_wait_returns_promptly_for_unknown_keys(self):
+        rows = self.cache()
+        started = time.monotonic()
+        rows.wait(["never-scheduled"], 5)
+        self.assertLess(time.monotonic() - started, 1)
+
+
+def stat_mode(path):
+    return os.stat(path).st_mode & 0o777
+
+
+class TestCachingSessionAttachesRowArt(ArtServerTestCase):
+    class _Browsing:
+        def __init__(self, payload, rows):
+            self._payload = payload
+            self.rows = rows
+
+        def snapshot(self):
+            return self._payload
+
+        def command(self, verb, arg=None):
+            pass
+
+        def browse(self, key, op, **kwargs):
+            # Shallow copy, the way BrowseSession.current() returns its rows:
+            # the row DICTS are shared with the session.
+            return {"ok": True, "level_id": 3, "path": ["Search"],
+                    "rows": list(self.rows)}
+
+    def setUp(self):
+        super().setUp()
+        self.payload = {
+            "v": 1, "status": "ok",
+            "core": {"host": self.host, "http_port": self.port, "name": "yavin"},
+            "zone": None, "zones": [],
+        }
+        self.rows = [
+            {"title": "Oingo Boingo", "image_key": "artist1"},
+            {"title": "Albums", "image_key": None},
+            {"title": "Dead Man's Party", "image_key": "album1"},
+        ]
+        self.cache = art.Cache(self.tmp.name)
+        self.row_cache = art.RowArtCache(self.tmp.name)
+        self.addCleanup(self.row_cache.close)
+        self.inner = self._Browsing(self.payload, self.rows)
+        self.session = art.CachingSession(self.inner, self.cache, self.row_cache)
+
+    def test_rows_carry_a_local_art_path_and_never_a_url(self):
+        self.session.snapshot()
+        reply = self.session.browse("widget", "search", term="oingo")
+        paths = [r["art_path"] for r in reply["rows"]]
+        self.assertEqual(paths, [art.path_for(self.row_cache._dir, "artist1"),
+                                 None,
+                                 art.path_for(self.row_cache._dir, "album1")])
+        self.assertNotIn("http", repr(reply))
+
+    def test_the_wrapped_session_s_rows_are_not_mutated(self):
+        self.session.snapshot()
+        self.session.browse("widget", "search", term="oingo")
+        self.assertNotIn("art_path", self.rows[0])
+
+    def test_level_fields_pass_through_unchanged(self):
+        self.session.snapshot()
+        reply = self.session.browse("widget", "search", term="oingo")
+        self.assertEqual((reply["ok"], reply["level_id"], reply["path"]),
+                         (True, 3, ["Search"]))
+
+    def test_rows_past_the_wait_window_arrive_on_a_later_current(self):
+        many = [{"title": "r%d" % i, "image_key": "key%d" % i} for i in range(30)]
+        self.inner.rows = many
+        self.session.snapshot()
+        with patch.object(art, "ROW_ART_WAIT_ROWS", 2):
+            self.session.browse("widget", "search", term="x")
+        self.row_cache.wait(["key%d" % i for i in range(30)], 5)
+        reply = self.session.browse("widget", "current")
+        self.assertTrue(all(r["art_path"] for r in reply["rows"]))
+
+    def test_without_a_known_core_nothing_is_fetched(self):
+        with patch.object(art, "fetch") as spy:
+            reply = self.session.browse("widget", "search", term="oingo")
+        spy.assert_not_called()
+        self.assertEqual([r.get("art_path") for r in reply["rows"]], [None] * 3)
+
+    def test_a_disconnected_snapshot_forgets_the_core(self):
+        self.session.snapshot()
+        self.payload["core"] = None
+        self.session.snapshot()
+        with patch.object(art, "fetch") as spy:
+            self.session.browse("widget", "search", term="oingo")
+        spy.assert_not_called()
+
+    def test_a_reply_without_rows_is_returned_as_is(self):
+        self.session.snapshot()
+        self.inner.browse = lambda *a, **k: {"ok": True, "played": True}
+        self.assertEqual(self.session.browse("widget", "activate", index=0),
+                         {"ok": True, "played": True})

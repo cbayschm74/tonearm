@@ -49,8 +49,10 @@ cannot redirect a later open. Reads add `O_NOFOLLOW`, an `S_ISREG` check and
 a size cap; writes go to an unguessable name created `O_EXCL|O_NOFOLLOW` and
 are renamed with both ends resolved against the same descriptor.
 
-`$XDG_RUNTIME_DIR/tonearm/` (0700) holds the socket and the art cache,
-capped at `MAX_CACHED` files. No user configuration outside tonearm's own
+`$XDG_RUNTIME_DIR/tonearm/` (0700) holds the socket and the art caches:
+`art/` for the now-playing cover, capped at `MAX_CACHED` files, and
+`rowart/` for browse-row thumbnails, capped at `MAX_ROW_CACHED` files of at
+most `MAX_ROW_ART_BYTES` each. No user configuration outside tonearm's own
 directories is modified.
 
 ## Privilege and sandboxing
@@ -69,7 +71,18 @@ discovery silently finds nothing.
 ## What the shared shell process consumes
 
 The widget runs inside `omarchy-shell`, so everything it reads is bounded
-producer-side. `art.is_publishable()` opens the cached thumbnail
+producer-side.
+
+The shell makes no network requests. Every cover the popup shows — now
+playing and every browse row — is fetched by `tonearmd` through
+`art.fetch()` and reaches QML only as `art_path`, a file in the 0700 cache,
+via `Model.artSource`/`Model.rowArtSource`, which refuse anything but a plain
+absolute path. `tests/python/test_qml_image_sources.py` fails the build if
+any QML `source:` binding bypasses them or any shell file contains a remote
+URL literal. `mpris:artUrl` is the same local file, never the Core's URL.
+Until 0.14.2 the `Image` elements loaded the Core's plaintext HTTP URL
+directly, outside every cap below; that was raised by this review on
+2026-10-31. `art.is_publishable()` opens the cached thumbnail
 `O_NOFOLLOW|O_NONBLOCK` and answers every question from that descriptor;
 fetched art is refused unless it is a PNG or JPEG within `MAX_ART_BYTES` and
 `MAX_ART_DIMENSION` per side, read from the PNG `IHDR` or by walking JPEG

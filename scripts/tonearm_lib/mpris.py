@@ -43,7 +43,6 @@ def metadata_for(payload: dict) -> dict:
     np = zone.get("now_playing")
     if not np:
         return {}
-    core = payload.get("core") or {}
 
     # Object paths accept only [A-Za-z0-9_]; Roon's keys contain hyphens, and a
     # malformed path makes some clients drop off the bus entirely.
@@ -56,13 +55,33 @@ def metadata_for(payload: dict) -> dict:
         "xesam:album": np.get("album", ""),
         "mpris:length": int((zone.get("length") or 0) * 1_000_000),
     }
-    image_key = np.get("image_key")
-    if image_key and core.get("host"):
-        md["mpris:artUrl"] = (
-            "http://%s:%s/api/image/%s?scale=fit&width=512&height=512"
-            % (core["host"], core.get("http_port", 9330), image_key)
-        )
+    # The daemon's cached copy, never the Core's http:// URL. Whatever reads
+    # this -- the shell's own media widget among them -- would fetch that URL
+    # itself, with none of art.py's byte or dimension caps: the same
+    # shell-side fetch the marketplace security review (2026-10-31) raised
+    # against the popup's Image. Omitted until the copy lands; the art
+    # cache's on_ready rebroadcast then updates it.
+    art_url = local_art_url(np.get("art_path"))
+    if art_url:
+        md["mpris:artUrl"] = art_url
     return md
+
+
+# The shape art.path_for() produces under the runtime directory. Anything
+# else is refused rather than published -- mirrored by Model.localArtSource
+# on the widget side.
+_LOCAL_PATH = re.compile(r"/[A-Za-z0-9._/-]+")
+MAX_ART_PATH = 4096
+
+
+def local_art_url(path) -> str | None:
+    if not isinstance(path, str) or len(path) > MAX_ART_PATH:
+        return None
+    if not _LOCAL_PATH.fullmatch(path) or path.startswith("//"):
+        return None
+    if any(part in (".", "..") for part in path.split("/")):
+        return None
+    return "file://" + path
 
 
 def _variants(md: dict) -> dict:

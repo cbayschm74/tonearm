@@ -1058,6 +1058,12 @@ class RoonSession:
             return session.page(kwargs.get("offset") or 0)
         if op == "reset":
             return session.reset()
+        if op == "current":
+            # Re-read the level the cursor is on, with no Roon round-trip.
+            # The widget sends this to pick up row art that was still being
+            # fetched when the level's first reply went out (art.py,
+            # RowArtCache); CachingSession attaches what has landed since.
+            return session.current()
         raise browse.BrowseError("bad_index", "unknown browse op %r" % (op,))
 
     # -- commands -------------------------------------------------------

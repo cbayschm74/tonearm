@@ -75,17 +75,18 @@ Panel {
   // a dimension the layout now derives everything else from.
   readonly property int artPx: Style.space(118)
   readonly property bool useArtAccent: root.setting("accentFromArt", true)
-  // The daemon's now_playing carries art_path: a LOCAL cached copy of the
-  // cover, nullable. ColorQuantizer cannot load the Core's own http:// art
-  // URL -- measured live, it returns zero colors against that URL and eight
-  // against the identical bytes read as file://. The popup's own Image below
-  // still displays the remote URL (Model.artUrl), which loads fine; only the
-  // quantizer needs the cached file.
-  readonly property string artPath: root.np && root.np.art_path ? root.np.art_path : ""
+  // The daemon's now_playing carries art_path: a LOCAL copy of the cover in
+  // its 0700 runtime cache, nullable until the fetch lands. It is the ONLY
+  // art this file loads -- both the card's Image and ColorQuantizer read it,
+  // through Model.artSource, which refuses anything but a plain absolute
+  // path. Until 0.14.2 the Image loaded the Core's http:// URL itself, so the
+  // shell fetched an unbounded body from whatever answered on that host:port
+  // (marketplace security review, 2026-10-31). tonearmd now does every fetch,
+  // under art.py's byte and dimension caps.
 
   ColorQuantizer {
     id: quantizer
-    source: root.artPath ? "file://" + root.artPath : ""
+    source: Model.artSource(root.st)
     depth: 3
     rescaleSize: 64
   }
@@ -185,8 +186,7 @@ Panel {
   // No album art here. An earlier version overlaid a cover-art thumbnail in
   // the glyph's corner, but at icon-slot resolution (a ~16-27px square) it
   // read as an indistinct smear, not art -- illegible rather than useful.
-  // Model.artUrl still exists and is tested; the popup is where the art has
-  // room to mean something.
+  // The popup is where the art has room to mean something.
   //
   // The glyph is now tonearm's PRODUCT icon (a record), not a transport mime.
   // Two things made that worth the swap. First, dropping the art badge left
@@ -403,17 +403,21 @@ Panel {
             color: Commons.Color.muted
             clip: true
 
+            // The muted Rectangle behind this IS the loading and failure
+            // state: the source is "" until the daemon's copy lands, and an
+            // Image that errors draws nothing, so either way the card shows
+            // the placeholder rather than a broken frame.
             Image {
               anchors.fill: parent
-              // The remote Core URL, NOT root.artPath -- that one is only for
-              // ColorQuantizer above. Measured live: this URL loads fine
-              // (status Ready, correctly sized); ColorQuantizer is the one that
-              // cannot read it.
-              source: root.display.showArt ? Model.artUrl(root.st, root.artPx * 2) : ""
+              // The daemon's cached file, never a Core URL -- see artSource
+              // above. tests/python/test_qml_image_sources.py holds every
+              // `source:` in this file to Model's local-path helpers.
+              source: root.display.showArt ? Model.artSource(root.st) : ""
               sourceSize.width: root.artPx * 2
               sourceSize.height: root.artPx * 2
               fillMode: Image.PreserveAspectCrop
               asynchronous: true
+              visible: status === Image.Ready
             }
           }
 

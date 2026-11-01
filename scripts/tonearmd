@@ -73,11 +73,13 @@ def main() -> int:
     # follow. See RoonSession._relocate.
     raw_session = RoonSession(on_change,
                               on_restart_needed=lambda: fail("the Roon Core moved"))
-    # ColorQuantizer cannot load the Core's remote :9330 image URL (measured:
-    # zero colors vs. eight for the identical bytes as a local file) -- so the
-    # daemon keeps a small local copy and hands back a path. See art.py.
+    # The widget never fetches art itself: every cover it shows -- now
+    # playing and every browse row -- is fetched here through art.fetch()'s
+    # byte and dimension caps, and reaches QML only as a path in the 0700
+    # runtime cache. See art.py.
     cache = art.Cache(server.runtime_dir(), on_ready=broadcast_current)
-    session = art.CachingSession(raw_session, cache)
+    row_cache = art.RowArtCache(server.runtime_dir())
+    session = art.CachingSession(raw_session, cache, row_cache)
 
     srv = server.Server(session)
     holder["srv"] = srv

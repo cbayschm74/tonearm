@@ -34,10 +34,31 @@ class TestMetadata(unittest.TestCase):
     def test_length_is_microseconds(self):
         self.assertEqual(mpris.metadata_for(PLAYING)["mpris:length"], 585_000_000)
 
-    def test_art_url_points_at_the_core_s_http_port(self):
-        self.assertEqual(mpris.metadata_for(PLAYING)["mpris:artUrl"],
-                         "http://192.168.50.118:9330/api/image/a1b2"
-                         "?scale=fit&width=512&height=512")
+    def test_art_url_is_the_daemon_s_cached_file(self):
+        # Not the Core's http:// URL. Whatever reads MPRIS metadata -- the
+        # shell's own media widget included -- would fetch that itself, with
+        # none of art.py's byte or dimension caps. The marketplace security
+        # review (2026-10-31) raised exactly that against the widget's Image;
+        # this is the same fetch by a different reader.
+        import copy
+        payload = copy.deepcopy(PLAYING)
+        payload["zone"]["now_playing"]["art_path"] = "/run/user/1000/tonearm/art/a1b2.jpg"
+        self.assertEqual(mpris.metadata_for(payload)["mpris:artUrl"],
+                         "file:///run/user/1000/tonearm/art/a1b2.jpg")
+
+    def test_art_url_is_omitted_until_the_daemon_has_a_local_copy(self):
+        # PLAYING has a Core and an image_key -- everything 0.14.1 built an
+        # http:// artUrl from -- but no art_path yet.
+        self.assertNotIn("mpris:artUrl", mpris.metadata_for(PLAYING))
+
+    def test_art_url_is_never_remote(self):
+        import copy
+        for art_path in ("http://evil/x.jpg", "relative/x.jpg", "/a/../b.jpg",
+                         "/a/b.jpg?x", None, 7):
+            payload = copy.deepcopy(PLAYING)
+            payload["zone"]["now_playing"]["art_path"] = art_path
+            self.assertNotIn("mpris:artUrl", mpris.metadata_for(payload),
+                             repr(art_path))
 
     def test_track_id_is_a_valid_object_path(self):
         # A bad path makes some clients disconnect from the bus entirely.

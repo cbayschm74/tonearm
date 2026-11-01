@@ -520,36 +520,114 @@ function nextRetryDelay(attempt) {
   return ms > 30000 ? 30000 : ms
 }
 
-// Extracted so browse rows and now-playing share one URL builder. Row art is
-// loaded by the widget straight from the Core (spec 4.4): a plain Image can
-// read these URLs -- only ColorQuantizer cannot -- so caching 100 images per
-// page in the daemon would be pure waste.
-// image_key is UNTRUSTED: it comes from the Core, and the URL built here is
-// handed to Image.source inside the shared shell process. art.py already
-// percent-encodes it on the daemon side ("treat it as untrusted before it
-// becomes part of a filesystem path"); this is the same rule on the side that
-// builds the network URL. Interpolated raw, a key carrying `&` or `?` rewrote
-// the query -- `k&width=99999` produced a second width parameter -- and one
-// carrying `/` or `..` walked the path.
-function imageUrl(core, imageKey, px) {
-  if (!core || !core.host) return ""
-  if (!imageKey) return ""
-  var size = px || 256
-  return "http://" + core.host + ":" + (core.http_port || 9330) +
-         "/api/image/" + encodeURIComponent(imageKey) +
-         "?scale=fit&width=" + size + "&height=" + size
+// -- album art ---------------------------------------------------------------
+// Art reaches an Image here ONLY as a local file the daemon fetched. Nothing in
+// this file builds a Core URL.
+//
+// Until 0.14.2 it did: artUrl/rowArtUrl turned image_key into the Core's
+// plaintext http://<core>:9330/api/image/<key> URL, and Panel.qml and
+// BrowsePane.qml handed that to Image.source -- so omarchy-shell, the process
+// every bar widget shares, fetched it. Qt reads the whole body before
+// decoding; `sourceSize` only bounds the decode. Whatever answered on that
+// host:port could exhaust shell memory, and art.py's byte cap, its dimension
+// check and tonearmd's MemoryMax all sat in the other process. Raised by the
+// Omarchy marketplace security review on 2026-10-31.
+//
+// Now tonearmd fetches every cover through art.fetch() and publishes a path
+// in its 0700 runtime cache: `now_playing.art_path` for the card, `art_path`
+// on each browse row. tests/python/test_qml_image_sources.py asserts that
+// every `source:` in every QML file goes through one of the helpers below.
+
+// Longest art path accepted. art.py's are ~60 characters.
+var MAX_ART_PATH = 4096
+
+// art_path crosses a process boundary, so it is checked for the one shape
+// art.path_for() produces -- an absolute path of plain characters with no
+// `.`/`..` segment -- rather than trusted. `?` and `#` are excluded because
+// they would be parsed as URL syntax once prefixed with file://. Anything
+// else yields "", which leaves the muted placeholder up.
+function localArtSource(path) {
+  if (typeof path !== "string") return ""
+  if (path.length === 0 || path.length > MAX_ART_PATH) return ""
+  if (!/^\/[A-Za-z0-9._\/-]+$/.test(path)) return ""
+  if (path.indexOf("//") === 0) return ""
+  var parts = path.split("/")
+  for (var i = 0; i < parts.length; i++) {
+    if (parts[i] === "." || parts[i] === "..") return ""
+  }
+  return "file://" + path
 }
 
-function artUrl(state, px) {
-  if (!state) return ""
+// The now-playing cover. "" until the daemon's copy has landed; the art
+// cache's on_ready rebroadcast delivers it, typically within a second.
+function artSource(state) {
   var np = nowPlayingOf(state)
-  return imageUrl(state.core, np && np.image_key, px)
+  return np ? localArtSource(np.art_path) : ""
 }
 
-function rowArtUrl(state, row, px) {
-  if (!state || !row) return ""
-  return imageUrl(state.core, row.image_key, px)
+function _ownArt(map, key) {
+  if (!map || typeof key !== "string" || key.length === 0) return undefined
+  // image_key is Core data used as a map key: never walk the prototype.
+  return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : undefined
 }
+
+// A browse row's thumbnail. The row's own art_path when the daemon had it at
+// reply time; otherwise whatever a later `current` refresh learned for the
+// same image_key (mergeRowArt), so art fills in without replacing the rows.
+function rowArtSource(row, artMap) {
+  if (!row) return ""
+  var own = localArtSource(row.art_path)
+  if (own) return own
+  return localArtSource(_ownArt(artMap, row.image_key))
+}
+
+// Bound on the image_key -> path map BrowsePane keeps across refreshes.
+var MAX_ROW_ART = 512
+
+// A NEW map (so the binding reading it re-evaluates) holding every validated
+// art_path in `rows`, keyed by image_key. Past MAX_ROW_ART the old entries
+// are dropped and only this reply's are kept: it is a cache of what the
+// daemon already said, so losing it costs nothing but a refresh.
+function mergeRowArt(map, rows) {
+  var out = {}
+  var count = 0
+  var src = map || {}
+  for (var k in src) {
+    if (Object.prototype.hasOwnProperty.call(src, k)) { out[k] = src[k]; count++ }
+  }
+  var fresh = {}
+  var freshCount = 0
+  var list = rows || []
+  for (var i = 0; i < list.length; i++) {
+    var row = list[i]
+    if (!row || typeof row.image_key !== "string" || row.image_key.length === 0) continue
+    if (!localArtSource(row.art_path)) continue
+    if (!Object.prototype.hasOwnProperty.call(fresh, row.image_key)) freshCount++
+    fresh[row.image_key] = row.art_path
+  }
+  if (count + freshCount > MAX_ROW_ART) { out = {} }
+  for (var f in fresh) {
+    if (Object.prototype.hasOwnProperty.call(fresh, f)) out[f] = fresh[f]
+  }
+  return out
+}
+
+// Does any row have art the daemon has not delivered yet? BrowsePane polls
+// `current` while this holds, a bounded number of times.
+function rowArtPending(rows, artMap) {
+  var list = rows || []
+  for (var i = 0; i < list.length; i++) {
+    var row = list[i]
+    if (!row || !row.image_key) continue
+    if (!rowArtSource(row, artMap)) return true
+  }
+  return false
+}
+
+// How BrowsePane polls for row art still being fetched: ROW_ART_RETRIES
+// `current` requests, ROW_ART_RETRY_MS apart, after a level first renders.
+var ROW_ART_RETRIES = 3
+var ROW_ART_RETRY_MS = 1200
 
 // Clamped, never wrapping. Wrapping in a short list makes Down feel like it
 // jumped to the top by accident; clamping is what every list in the shell does.
@@ -666,9 +744,15 @@ if (typeof module !== "undefined") {
     volumeFraction: volumeFraction,
     volumeFromFraction: volumeFromFraction,
     nextRetryDelay: nextRetryDelay,
-    artUrl: artUrl,
-    imageUrl: imageUrl,
-    rowArtUrl: rowArtUrl,
+    localArtSource: localArtSource,
+    artSource: artSource,
+    rowArtSource: rowArtSource,
+    mergeRowArt: mergeRowArt,
+    rowArtPending: rowArtPending,
+    MAX_ART_PATH: MAX_ART_PATH,
+    MAX_ROW_ART: MAX_ROW_ART,
+    ROW_ART_RETRIES: ROW_ART_RETRIES,
+    ROW_ART_RETRY_MS: ROW_ART_RETRY_MS,
     moveCursor: moveCursor,
     browseArgv: browseArgv,
     browseSession: browseSession,

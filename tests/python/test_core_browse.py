@@ -115,6 +115,19 @@ class TestDispatch(unittest.TestCase):
         self.assertEqual([r["title"] for r in reply["rows"]],
                          ["Oingo Boingo", "Albums", "Tracks"])
 
+    def test_current_rereads_the_level_without_asking_the_core(self):
+        # The widget's row-art refresh: rows whose art the daemon was still
+        # fetching when the first reply went out pick it up from this, so it
+        # must neither move the cursor nor cost a Roon round-trip.
+        api = fake_api()
+        s = FakeSession(api)
+        first = s.browse("widget", "search", term="oingo boingo")
+        calls = len(api.calls)
+        again = s.browse("widget", "current")
+        self.assertEqual(len(api.calls), calls)
+        self.assertEqual(again["level_id"], first["level_id"])
+        self.assertEqual(again["rows"], first["rows"])
+
     def test_an_unknown_op_is_rejected(self):
         s = FakeSession(fake_api())
         with self.assertRaises(browse.BrowseError):

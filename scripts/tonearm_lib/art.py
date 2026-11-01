@@ -1,15 +1,27 @@
-"""Local cache of a small cover-art copy, for `ColorQuantizer`.
+"""Local cache of cover art: the ONLY way art reaches the widget.
 
-Measured in a live Quickshell probe: `ColorQuantizer` pointed at the Core's
-remote `http://<core>:9330/api/image/<key>` URL emits **zero** colors;
-pointed at the identical bytes as a local `file://` it emits eight. A plain
-`Image` loads the remote URL fine, so this only affects accent extraction,
-not the art display. Left unfixed, the album-art accent would silently do
-nothing -- always falling back to the theme accent, with no error anywhere.
+Every cover the popup shows -- the now-playing card and every browse row --
+is fetched here and handed to QML as a path in the 0700 runtime cache. The
+widget never builds a Core URL and never fetches anything itself.
 
-So the daemon keeps a local copy: when the followed zone's `image_key`
-changes, fetch a 64px copy (what the quantizer samples) into
-`$XDG_RUNTIME_DIR/tonearm/art/<image_key>.jpg` and hand back its path.
+Until 0.14.2 the popup's `Image` elements loaded the Core's
+`http://<core>:9330/api/image/<key>` URL directly, from inside omarchy-shell,
+the process every bar widget shares. Qt reads that whole response before
+decoding it -- `sourceSize` only bounds the decode -- so whatever answered on
+that host:port could exhaust shell memory with an oversized body, and none of
+the caps below applied. Raised by the Omarchy marketplace security review on
+2026-10-31. Routing every fetch through `fetch()` puts the byte cap, the
+header-checked dimension cap and the same-origin redirect rule in front of
+every image the shell decodes.
+
+Two caches, the same fetcher:
+
+- `Cache` keeps the followed zone's cover at display size in `art/`. The
+  popup draws it and `ColorQuantizer` samples it -- which needed a local copy
+  regardless: measured in a live Quickshell probe, the quantizer pointed at
+  the remote URL emits zero colors, and eight for the same bytes as a file.
+- `RowArtCache` keeps browse-row thumbnails in `rowart/`, fetched by a small
+  fixed pool so a 100-row page never means 100 threads.
 
 This module owns I/O only. It never decides how art is displayed -- it
 emits a path, or `None`, and nothing else. Fetching happens on a background
@@ -19,45 +31,82 @@ and reported as `None`, never raised.
 
 from __future__ import annotations
 
+import collections
 import http.client
 import logging
 import os
+import queue
 import re
 import secrets
 import stat
 import struct
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 LOG = logging.getLogger("tonearmd.art")
 
-# Seconds to wait for the Core to answer one image request. This is a 64px
-# thumbnail on the LAN; a Core that cannot answer this quickly is not one
+# Seconds to wait for the Core to answer one image request. This is a small
+# image on the LAN; a Core that cannot answer this quickly is not one
 # whose art is worth waiting on -- give up and try again next track.
 FETCH_TIMEOUT = 5.0
 
-# How many cached images to keep on disk. One image_key per track and only
+# Requested sizes. The now-playing copy is what the popup DISPLAYS -- about
+# 236 device pixels at the default theme scale, more under a larger one -- and
+# also what ColorQuantizer samples, which rescales to 64 itself. A browse row
+# is drawn at ~60. Both are requests the Core may ignore; the caps below are
+# what holds when it does.
+NOW_PLAYING_PX = 512
+ROW_PX = 128
+
+# How many now-playing images to keep on disk. One image_key per track and only
 # the followed zone is ever cached, so this is generous headroom, not a
 # tight budget -- just enough to stop the directory from growing without
 # bound over a long-running daemon.
 MAX_CACHED = 10
 
-# The URL below asks the Core for a 64x64 thumbnail, which measures a few KB.
+# The URL asks the Core for a NOW_PLAYING_PX square, which measures tens of KB.
 # Only the reader can enforce that it got one: the request is a preference, and
-# whatever answers on that host:port decides what to send. 1 MiB is ~100x the
+# whatever answers on that host:port decides what to send. 1 MiB is ~10x the
 # real size and still far too small to matter to the daemon.
 #
 # The same number bounds what is PUBLISHED as `art_path`, because that file is
-# read by ColorQuantizer inside the shared shell process, and Quickshell
-# exports no filesystem primitive able to bound it there.
+# read by the popup's Image and ColorQuantizer inside the shared shell
+# process, and Quickshell exports no filesystem primitive able to bound it
+# there.
 MAX_ART_BYTES = 1024 * 1024
+
+# Browse rows: up to a page (browse.PAGE, 100) of them at once, so both the
+# per-file cap and the file count are tighter than the now-playing cache's.
+# Worst case on disk is MAX_ROW_CACHED * MAX_ROW_ART_BYTES = 40 MiB of tmpfs; a
+# real 128px thumbnail is a few KB.
+MAX_ROW_ART_BYTES = 256 * 1024
+MAX_ROW_CACHED = 160
+
+# Fetch workers for row art, and how many keys may be queued for them. A
+# search that returns a page queues at most a page; this bounds what a burst
+# of searches -- or a local client looping on browse -- can pile up.
+ROW_FETCH_WORKERS = 4
+MAX_ROW_PENDING = 200
+
+# A browse reply waits at most ROW_ART_WAIT seconds for the first
+# ROW_ART_WAIT_ROWS rows' art -- what the pane shows without scrolling -- so
+# the common case renders with art on the first paint. Everything else
+# arrives through the widget's `current` refresh.
+ROW_ART_WAIT = 1.0
+ROW_ART_WAIT_ROWS = 10
+
+# A key whose fetch failed is not retried for this long, so a Core with no
+# art for a row is not asked again on every keystroke of navigation.
+ROW_RETRY_AFTER = 60.0
+MAX_ROW_FAILED = 512
 
 # Bounds on what the bytes DECODE to, which the byte cap above cannot see. A
 # few hundred bytes of PNG header can declare 30000x30000 -- 3.6 GB of RGBA in
-# whatever opens it, which here is ColorQuantizer inside the shared shell
-# process. The URL asks for 64x64; 2048 per side is a wide margin for a Core
+# whatever opens it, which here is the popup inside the shared shell process.
+# The URL asks for at most NOW_PLAYING_PX; 2048 per side is a wide margin for a Core
 # that ignores the hint and returns a full-size cover, and still two orders of
 # magnitude below a bomb.
 MAX_ART_DIMENSION = 2048
@@ -170,16 +219,19 @@ def path_for(cache_dir: str, image_key: str) -> str:
     return os.path.join(cache_dir, _safe_name(image_key))
 
 
-def _image_url(host: str, http_port: int, image_key: str) -> str:
+def _image_url(host: str, http_port: int, image_key: str,
+               px: int = NOW_PLAYING_PX) -> str:
     # image_key is untrusted (it comes from the Core); percent-encode it
     # rather than interpolating it raw, the same caution _safe_name already
     # applies on the filesystem side.
-    return "http://%s:%d/api/image/%s?scale=fit&width=64&height=64" % (
-        host, http_port, urllib.parse.quote(image_key, safe=""))
+    size = int(px)
+    return "http://%s:%d/api/image/%s?scale=fit&width=%d&height=%d" % (
+        host, http_port, urllib.parse.quote(image_key, safe=""), size, size)
 
 
-def fetch(host: str, http_port: int, image_key: str, dest: str) -> bool:
-    """Fetch a 64px copy of `image_key`'s art into `dest`.
+def fetch(host: str, http_port: int, image_key: str, dest: str,
+          px: int = NOW_PLAYING_PX, max_bytes: int = MAX_ART_BYTES) -> bool:
+    """Fetch a `px`-square copy of `image_key`'s art into `dest`.
 
     Returns whether it succeeded. Never raises: a network error, a timeout,
     a non-2xx response, a redirect off the Core, a malformed/truncated body
@@ -187,7 +239,7 @@ def fetch(host: str, http_port: int, image_key: str, dest: str) -> bool:
     `False`, so a bad fetch degrades to `art_path: null` instead of taking
     the daemon down.
     """
-    url = _image_url(host, http_port, image_key)
+    url = _image_url(host, http_port, image_key, px)
     directory = os.path.dirname(dest)
     name = os.path.basename(dest)
     dir_fd = None
@@ -207,10 +259,10 @@ def fetch(host: str, http_port: int, image_key: str, dest: str) -> bool:
         with _OPENER.open(url, timeout=FETCH_TIMEOUT) as response:
             # One byte past the cap, so "at the limit" and "over it" are
             # distinguishable without reading the rest of an endless body.
-            data = response.read(MAX_ART_BYTES + 1)
-        if len(data) > MAX_ART_BYTES:
+            data = response.read(max_bytes + 1)
+        if len(data) > max_bytes:
             LOG.warning("art for %s exceeds %d bytes; refusing it",
-                        image_key, MAX_ART_BYTES)
+                        image_key, max_bytes)
             return False
 
         # The byte cap says nothing about what the bytes ARE. Whatever
@@ -267,7 +319,7 @@ def fetch(host: str, http_port: int, image_key: str, dest: str) -> bool:
                 pass
 
 
-def is_publishable(path: str) -> bool:
+def is_publishable(path: str, max_bytes: int = MAX_ART_BYTES) -> bool:
     """May this path be handed to the widget as `art_path`?
 
     Whatever this returns is read by `ColorQuantizer` inside the shared
@@ -299,7 +351,7 @@ def is_publishable(path: str) -> bool:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             return False
-        if info.st_size > MAX_ART_BYTES:
+        if info.st_size > max_bytes:
             return False
         with os.fdopen(fd, "rb") as handle:
             fd = None                       # the file object owns it now
@@ -406,7 +458,8 @@ class Cache:
 
     def _fetch_and_prune(self, host: str, http_port: int, image_key: str,
                           dest: str) -> None:
-        if not fetch(host, http_port, image_key, dest):
+        if not fetch(host, http_port, image_key, dest,
+                     px=NOW_PLAYING_PX, max_bytes=MAX_ART_BYTES):
             return
         _prune(self._dir, keep=dest)
         if self._on_ready:
@@ -414,6 +467,125 @@ class Cache:
                 self._on_ready()
             except Exception:
                 LOG.exception("art on_ready callback failed")
+
+
+class RowArtCache:
+    """Browse-row thumbnails, fetched by a fixed pool into `rowart/`.
+
+    Same contract as `Cache.get()`: never blocks on the network, returns a
+    publishable path or None, and schedules a fetch for a key it does not
+    have. What differs is scale -- a browse reply carries up to a page of
+    keys at once -- so fetches go through ROW_FETCH_WORKERS daemon threads
+    reading a queue bounded by MAX_ROW_PENDING, a key is never queued twice,
+    and a key that failed is left alone for ROW_RETRY_AFTER seconds.
+
+    Daemon threads, not a ThreadPoolExecutor: the executor's workers are
+    joined at interpreter exit, so a stop with a queue of fetches behind a
+    stalled Core would hold the daemon up for FETCH_TIMEOUT per queued key.
+    """
+
+    def __init__(self, runtime_dir: str, workers: int = ROW_FETCH_WORKERS) -> None:
+        self._dir = os.path.join(runtime_dir, "rowart")
+        # Eager for the same reason as Cache: RuntimeDirectory= is wiped on
+        # every stop.
+        os.makedirs(self._dir, mode=0o700, exist_ok=True)
+        self._lock = threading.Lock()
+        self._queue: queue.Queue = queue.Queue()
+        self._pending: dict[str, threading.Event] = {}
+        self._failed: collections.OrderedDict[str, float] = collections.OrderedDict()
+        self._workers = [threading.Thread(target=self._work, daemon=True,
+                                          name="tonearm-rowart-%d" % i)
+                         for i in range(workers)]
+        for thread in self._workers:
+            thread.start()
+
+    def lookup(self, image_key: str | None) -> str | None:
+        """The cached path for `image_key` if it is publishable, else None.
+
+        Touches the file's mtime on a hit, so _prune's oldest-first is
+        least-recently-USED and a page being looked at keeps its art.
+        """
+        if not image_key:
+            return None
+        dest = path_for(self._dir, image_key)
+        if not is_publishable(dest, max_bytes=MAX_ROW_ART_BYTES):
+            return None
+        try:
+            os.utime(dest)
+        except OSError:
+            pass
+        return dest
+
+    def get(self, host: str | None, http_port: int | None,
+            image_key: str | None) -> str | None:
+        if not image_key or not host:
+            return None
+        path = self.lookup(image_key)
+        if path is not None:
+            return path
+        with self._lock:
+            if image_key in self._pending:
+                return None
+            failed_at = self._failed.get(image_key)
+            if failed_at is not None:
+                if time.monotonic() - failed_at < ROW_RETRY_AFTER:
+                    return None
+                del self._failed[image_key]
+            if len(self._pending) >= MAX_ROW_PENDING:
+                return None
+            done = threading.Event()
+            self._pending[image_key] = done
+        self._queue.put((host, http_port or 9330, image_key, done))
+        return None
+
+    def wait(self, keys, timeout: float) -> None:
+        """Block until every scheduled fetch among `keys` has finished, or
+        `timeout` seconds have passed in total. Keys not in flight are
+        skipped, so this never waits on something that will not happen."""
+        deadline = time.monotonic() + timeout
+        for key in keys:
+            with self._lock:
+                done = self._pending.get(key)
+            if done is None:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            done.wait(remaining)
+
+    def close(self) -> None:
+        for _ in self._workers:
+            self._queue.put(None)
+        for thread in self._workers:
+            thread.join(FETCH_TIMEOUT + 1)
+
+    def _work(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is None:
+                return
+            host, http_port, image_key, done = job
+            ok = False
+            try:
+                dest = path_for(self._dir, image_key)
+                ok = fetch(host, http_port, image_key, dest,
+                           px=ROW_PX, max_bytes=MAX_ROW_ART_BYTES)
+                if ok:
+                    _prune(self._dir, keep=dest, max_files=MAX_ROW_CACHED)
+            except Exception:
+                # fetch() never raises by contract; this keeps a worker alive
+                # if that contract is ever broken, since a dead worker is a
+                # silently shrinking pool.
+                LOG.exception("row art fetch for %s failed", image_key)
+            finally:
+                with self._lock:
+                    self._pending.pop(image_key, None)
+                    if not ok:
+                        self._failed[image_key] = time.monotonic()
+                        self._failed.move_to_end(image_key)
+                        while len(self._failed) > MAX_ROW_FAILED:
+                            self._failed.popitem(last=False)
+                done.set()
 
 
 class CachingSession:
@@ -482,16 +654,24 @@ class CachingSession:
     scratch rather than assuming the old one still holds.
     """
 
-    def __init__(self, session, cache: Cache) -> None:
+    def __init__(self, session, cache: Cache,
+                 row_cache: RowArtCache | None = None) -> None:
         self._session = session
         self._cache = cache
+        self._row_cache = row_cache
         self._lock = threading.Lock()
+        # (host, http_port) of the Core the last snapshot reported, for row
+        # art: a browse reply does not carry it. One tuple assignment, so a
+        # browse thread reading it never sees half of one.
+        self._core: tuple | None = None
 
     def snapshot(self) -> dict:
         with self._lock:
             payload = self._session.snapshot()
             zone = payload.get("zone")
             core = payload.get("core")
+            self._core = ((core.get("host"), core.get("http_port"))
+                          if core and core.get("host") else None)
             if zone and core:
                 np = zone.get("now_playing")
                 if np is not None:
@@ -517,6 +697,38 @@ class CachingSession:
         #    ends up calling back into snapshot() on the same thread would
         #    hang trying to reacquire a lock it already holds.
         #
-        # Pure pass-through, no art logic: browse replies carry image_key,
-        # and it's the widget's job to build URLs from it, not this class's.
-        return self._session.browse(key, op, **kwargs)
+        # Browse replies carry image_key per row. Until 0.14.2 the widget
+        # built a Core URL from it and fetched that inside the shell; now
+        # each row gains `art_path` here instead, the same way now_playing
+        # does in snapshot(), and the widget only ever loads that file.
+        return self._attach_row_art(self._session.browse(key, op, **kwargs))
+
+    def _attach_row_art(self, reply):
+        rows = reply.get("rows") if isinstance(reply, dict) else None
+        if self._row_cache is None or not isinstance(rows, list) or not rows:
+            return reply
+        core = self._core
+        keys = [row.get("image_key") if isinstance(row, dict) else None
+                for row in rows]
+        if core is not None:
+            host, http_port = core
+            # In row order, so the queue serves the visible rows first.
+            for image_key in keys:
+                if image_key:
+                    self._row_cache.get(host, http_port, image_key)
+            first = [k for k in keys[:ROW_ART_WAIT_ROWS] if k]
+            self._row_cache.wait(first, ROW_ART_WAIT)
+        out = []
+        for row, image_key in zip(rows, keys):
+            if not isinstance(row, dict):
+                out.append(row)
+                continue
+            # A new dict: BrowseSession.current() copies its row LIST, not
+            # the rows, so writing into these would edit the session's state.
+            row = dict(row)
+            row["art_path"] = (self._row_cache.lookup(image_key)
+                               if image_key and core is not None else None)
+            out.append(row)
+        reply = dict(reply)
+        reply["rows"] = out
+        return reply

@@ -54,7 +54,8 @@ def to_request(argv: list[str]) -> dict:
             raise ValueError(
                 "usage: tonearmctl browse [--session <key>] search <term>"
                 " | enter <i> <level_id> | activate <i> <level_id>"
-                " | play <i> <level_id> | back | page <offset> | reset")
+                " | play <i> <level_id> | back | page <offset> | reset"
+                " | current")
         return request
 
     raise ValueError("unknown verb %r" % verb)
@@ -111,6 +112,6 @@ def browse_request(argv):
         if offset is None:
             return None
         return dict(base, offset=offset)
-    if op in ("back", "reset"):
+    if op in ("back", "reset", "current"):
         return base
     return None

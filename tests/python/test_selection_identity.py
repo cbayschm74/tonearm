@@ -35,6 +35,14 @@ def session(pin=None, strict=True, zones=(), generation=0, status="ok"):
 
 
 class SelectionIdentityTest(unittest.TestCase):
+    def test_missing_generation_marker_fails_closed(self):
+        s = session("pin", zones=[zone("pin")], generation=1)
+        del s._api._zone_list_generation
+        snap = s.snapshot()
+        self.assertEqual(snap["selection"]["availability"], "unknown")
+        self.assertIsNone(snap["zone"])
+        self.assertEqual(snap["zones"], [])
+
     def test_paused_pin_wins_over_other_playing_zone(self):
         s = session("pin", zones=[zone("pin"), zone("other", "playing")], generation=1)
         snap = s.snapshot()

@@ -38,3 +38,8 @@ direct CLI/MPRIS commands still use the existing command path, which can read
 cached zones while status has returned to `ok`. Command readiness and
 target/result protocol are separate work. This checkpoint adds no command
 targeting, result protocol, QML control, or visual acceptance.
+
+Review follow-up: missing `_zone_list_generation` defaults to zero, so an API
+without an authoritative full-list marker remains unknown. Test doubles that
+represent a loaded list explicitly set their marker. Rebased on 0.14.2 with its
+local-art-only security fix preserved. No player-control or queue feature change.

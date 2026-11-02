@@ -549,8 +549,8 @@ class RoonSession:
             return state.build(self._status, core, None, [],
                                selection=state.selection(self._arbiter.pinned_id,
                                                          None, [], False))
-        # Old test doubles have no marker; real instances are seeded at zero.
-        generation = getattr(self._api, "_zone_list_generation", 1) if self._api else 0
+        # Unknown API objects cannot establish an authoritative listing.
+        generation = getattr(self._api, "_zone_list_generation", 0) if self._api else 0
         authoritative = generation >= self._required_zone_generation
         # roonapi can retain last session's map while its replacement socket
         # is up but has not delivered the new full listing. Do not feed that
@@ -643,7 +643,7 @@ class RoonSession:
         if self._status == "ok" and self._down_samples >= DOWN_SAMPLES:
             self._required_zone_generation = max(
                 self._required_zone_generation,
-                getattr(self._api, "_zone_list_generation", 1) + 1)
+                getattr(self._api, "_zone_list_generation", 0) + 1)
             self._status = _unreachable_status(self._cfg.get('host'))
             LOG.warning("Roon connection lost after %d polls: %s",
                         self._down_samples, self._status)

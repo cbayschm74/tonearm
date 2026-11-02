@@ -58,3 +58,27 @@ on a bump: if 0.1.7 has fixed it, drop the divergence and the test with it.
   `SOOD\x02` datagram, and `_parse_property` misaligns on multi-byte UTF-8.
   `TestNoSoodImplementation` in `tests/python/test_vendor_patches.py` asserts
   they stay removed after a vendor refresh.
+
+### Queue subscription lifecycle (split from tonearm #46)
+
+`roonapi.py` adds opt-in `subscribe_queue(callback, zone_id, max_item_count=100)`.
+It requires an explicit zone and a count of 1–100, returns a captured-socket
+cancellation handle, and passes the response name plus body to its callback.
+The existing register_queue_callback remains body-only and returns None.
+
+`roonapisocket.py` registers before send, allocates request/subscription IDs under
+a short map lock, invalidates routing before cancellation, avoids ordinary result
+entries for subscription traffic, and drops unknown/late replies. Disconnected
+legacy subscribe registers nothing; stop invalidates before best-effort cancel
+and closes even if cancellation fails. Queue parse errors omit message bodies.
+
+Regression tests: test_queue_feasibility.py and test_queue_subscription.py.
+All event bodies are synthetic: these tests establish transport ownership, not
+live queue schema validation or a production queue UI. No daemon cache/UI/wire
+probe or preview harness is included. On refresh, reapply or deliberately retire
+this patch after running these tests and the full suite.
+
+This is not a complete general request-ownership (#30) or callback-fanout (#38)
+fix. Ordinary _request can still reread the current socket. Cancellation does not
+acknowledge remote completion or join a callback already admitted concurrently;
+the caller remains responsible for rejecting stale callback state.

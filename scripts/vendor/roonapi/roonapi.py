@@ -476,6 +476,18 @@ class RoonApi:  # pylint: disable=too-many-instance-attributes, too-many-lines
             opt_data = None
         self._roonsocket.subscribe(SERVICE_TRANSPORT, "queue", callback, opt_data)
 
+    # LOCAL PATCH (tonearm queue): opt-in, owned and bounded; legacy hook unchanged.
+    # LOCAL PATCH (tonearm #46): bounded, explicitly owned queue subscription.
+    def subscribe_queue(self, callback, zone_id, max_item_count=100):
+        if (not callable(callback) or not isinstance(zone_id, str)
+                or not 0 < len(zone_id) <= 128 or type(max_item_count) is not int
+                or not 1 <= max_item_count <= 100):
+            raise ValueError("invalid bounded queue subscription")
+        sock = self._roonsocket
+        if sock is None or not sock.connected:
+            raise RuntimeError("queue socket unavailable")
+        return sock.subscribe_owned_queue(callback, zone_id, max_item_count)
+
     def browse_browse(self, opts):
         """
         Complex browse call on the roon api.
